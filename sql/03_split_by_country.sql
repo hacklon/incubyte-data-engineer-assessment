@@ -1,0 +1,292 @@
+-- =============================================================================
+-- SkyPoints Loyalty Data Engine — Country Target Routing & Migration Procedure
+-- Deliverable 3: Split members into per-country target tables with "Latest Record Wins"
+-- Handles cross-country member relocations atomically
+-- =============================================================================
+
+USE DATABASE SKYPOINTS_DB;
+USE SCHEMA OPS;
+
+CREATE OR REPLACE PROCEDURE OPS.SP_ROUTE_MEMBERS_TO_COUNTRIES(P_BATCH_ID VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    -- Step 1: Create a temporary working table holding winning delta records for this batch
+    CREATE OR REPLACE TEMPORARY TABLE _TMP_WINNING_MEMBERS AS
+    WITH RankedBatch AS (
+        -- Intra-batch deduplication: keep newest record per MEMBER_ID
+        SELECT 
+            MEMBER_ID,
+            MEMBER_NAME,
+            ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE,
+            TIER_CODE,
+            AGENT_NAME,
+            STATE_CODE,
+            COUNTRY_CODE,
+            POST_CODE,
+            DATE_OF_BIRTH,
+            AGE,
+            DAYS_SINCE_FLIGHT,
+            STALE_MEMBER,
+            IS_ACTIVE,
+            BATCH_ID,
+            BATCH_TIMESTAMP,
+            SOURCE_ROW_NUMBER
+        FROM STG.MEMBER_PROFILES_ENRICHED
+        WHERE BATCH_ID = :P_BATCH_ID
+          AND DQ_STATUS = 'VALID'
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY MEMBER_ID 
+            ORDER BY BATCH_TIMESTAMP DESC, SOURCE_ROW_NUMBER DESC
+        ) = 1
+    )
+    SELECT 
+        b.*,
+        r.CURRENT_COUNTRY AS PREVIOUS_COUNTRY,
+        CASE 
+            WHEN r.MEMBER_ID IS NULL THEN 'INSERT_NEW'
+            WHEN b.BATCH_TIMESTAMP > r.VERSION_TIMESTAMP 
+                 OR (b.BATCH_TIMESTAMP = r.VERSION_TIMESTAMP AND b.SOURCE_ROW_NUMBER >= r.SOURCE_ROW_NUMBER)
+                 THEN IFF(b.COUNTRY_CODE != r.CURRENT_COUNTRY, 'COUNTRY_MIGRATION', 'SAME_COUNTRY_UPDATE')
+            ELSE 'DISCARD_OUTDATED'
+        END AS ACTION_TYPE
+    FROM RankedBatch b
+    LEFT JOIN CORE.CURRENT_MEMBER_REGISTRY r
+        ON b.MEMBER_ID = r.MEMBER_ID;
+
+    -- Step 2: Atomic Transaction for Country Relocations and Target Upserts
+    BEGIN TRANSACTION;
+
+        -- ---------------------------------------------------------------------
+        -- A. Handle Country Migrations: Remove relocated members from OLD table
+        -- ---------------------------------------------------------------------
+        DELETE FROM CORE.TABLE_INDIA 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY = 'IND');
+
+        DELETE FROM CORE.TABLE_USA 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY = 'USA');
+
+        DELETE FROM CORE.TABLE_AUSTRALIA 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY = 'AUS');
+
+        DELETE FROM CORE.TABLE_CANADA 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY = 'CAN');
+
+        DELETE FROM CORE.TABLE_PHILIPPINES 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY = 'PHL');
+
+        DELETE FROM CORE.TABLE_OTHER_COUNTRIES 
+        WHERE MEMBER_ID IN (SELECT MEMBER_ID FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE = 'COUNTRY_MIGRATION' AND PREVIOUS_COUNTRY NOT IN ('IND', 'USA', 'AUS', 'CAN', 'PHL'));
+
+        -- ---------------------------------------------------------------------
+        -- B. Upsert into Target Country Tables (Active Country)
+        -- ---------------------------------------------------------------------
+
+        -- Target: TABLE_INDIA
+        MERGE INTO CORE.TABLE_INDIA t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE = 'IND' AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- Target: TABLE_USA
+        MERGE INTO CORE.TABLE_USA t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE = 'USA' AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- Target: TABLE_AUSTRALIA
+        MERGE INTO CORE.TABLE_AUSTRALIA t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE = 'AUS' AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- Target: TABLE_CANADA
+        MERGE INTO CORE.TABLE_CANADA t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE = 'CAN' AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- Target: TABLE_PHILIPPINES
+        MERGE INTO CORE.TABLE_PHILIPPINES t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE = 'PHL' AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- Target: TABLE_OTHER_COUNTRIES
+        MERGE INTO CORE.TABLE_OTHER_COUNTRIES t
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE COUNTRY_CODE NOT IN ('IND', 'USA', 'AUS', 'CAN', 'PHL') AND ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON t.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            MEMBER_NAME       = s.MEMBER_NAME,
+            ENROLLMENT_DATE   = s.ENROLLMENT_DATE,
+            LAST_FLIGHT_DATE  = s.LAST_FLIGHT_DATE,
+            TIER_CODE         = s.TIER_CODE,
+            AGENT_NAME        = s.AGENT_NAME,
+            STATE_CODE        = s.STATE_CODE,
+            POST_CODE         = s.POST_CODE,
+            DATE_OF_BIRTH     = s.DATE_OF_BIRTH,
+            AGE               = s.AGE,
+            DAYS_SINCE_FLIGHT = s.DAYS_SINCE_FLIGHT,
+            STALE_MEMBER      = s.STALE_MEMBER,
+            IS_ACTIVE         = s.IS_ACTIVE,
+            LAST_UPDATED_AT   = CURRENT_TIMESTAMP(),
+            SOURCE_BATCH_ID   = s.BATCH_ID
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, MEMBER_NAME, ENROLLMENT_DATE, LAST_FLIGHT_DATE, TIER_CODE,
+            AGENT_NAME, STATE_CODE, COUNTRY_CODE, POST_CODE, DATE_OF_BIRTH,
+            AGE, DAYS_SINCE_FLIGHT, STALE_MEMBER, IS_ACTIVE, LAST_UPDATED_AT, SOURCE_BATCH_ID
+        ) VALUES (
+            s.MEMBER_ID, s.MEMBER_NAME, s.ENROLLMENT_DATE, s.LAST_FLIGHT_DATE, s.TIER_CODE,
+            s.AGENT_NAME, s.STATE_CODE, s.COUNTRY_CODE, s.POST_CODE, s.DATE_OF_BIRTH,
+            s.AGE, s.DAYS_SINCE_FLIGHT, s.STALE_MEMBER, s.IS_ACTIVE, CURRENT_TIMESTAMP(), s.BATCH_ID
+        );
+
+        -- ---------------------------------------------------------------------
+        -- C. Synchronize Operational Registry with Winning Version State
+        -- ---------------------------------------------------------------------
+        MERGE INTO CORE.CURRENT_MEMBER_REGISTRY r
+        USING (SELECT * FROM _TMP_WINNING_MEMBERS WHERE ACTION_TYPE IN ('INSERT_NEW', 'SAME_COUNTRY_UPDATE', 'COUNTRY_MIGRATION')) s
+        ON r.MEMBER_ID = s.MEMBER_ID
+        WHEN MATCHED THEN UPDATE SET
+            CURRENT_COUNTRY     = s.COUNTRY_CODE,
+            TARGET_TABLE_NAME   = 'TABLE_' || s.COUNTRY_CODE,
+            VERSION_TIMESTAMP   = s.BATCH_TIMESTAMP,
+            SOURCE_ROW_NUMBER   = s.SOURCE_ROW_NUMBER,
+            LAST_FLIGHT_DATE    = s.LAST_FLIGHT_DATE,
+            TIER_CODE           = s.TIER_CODE,
+            IS_ACTIVE           = s.IS_ACTIVE,
+            STALE_MEMBER        = s.STALE_MEMBER,
+            UPDATED_AT          = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT (
+            MEMBER_ID, CURRENT_COUNTRY, TARGET_TABLE_NAME, VERSION_TIMESTAMP,
+            SOURCE_ROW_NUMBER, LAST_FLIGHT_DATE, TIER_CODE, IS_ACTIVE,
+            STALE_MEMBER, FIRST_ENROLLED_DATE, UPDATED_AT
+        ) VALUES (
+            s.MEMBER_ID, s.COUNTRY_CODE, 'TABLE_' || s.COUNTRY_CODE, s.BATCH_TIMESTAMP,
+            s.SOURCE_ROW_NUMBER, s.LAST_FLIGHT_DATE, s.TIER_CODE, s.IS_ACTIVE,
+            s.STALE_MEMBER, s.ENROLLMENT_DATE, CURRENT_TIMESTAMP()
+        );
+
+    COMMIT;
+
+    RETURN 'SUCCESS: Country targets synchronized and latest record wins applied for batch ' || :P_BATCH_ID;
+END;
+$$;
