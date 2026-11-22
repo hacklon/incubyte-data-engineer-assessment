@@ -1,0 +1,5 @@
+# SkyPoints Loyalty Data Engine Dependencies
+# Core engine and tests use Python 3.9+ Standard Library (zero external dependencies required)
+
+# Optional: PyTest for advanced test runner reporting
+pytest>=7.0.0
