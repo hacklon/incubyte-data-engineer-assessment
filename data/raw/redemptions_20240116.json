@@ -1,0 +1,22 @@
+[
+  {
+    "member_id": "223457",
+    "feed_date": "20240116",
+    "redemptions": [
+      {
+        "txn_id": "RX10092",
+        "txn_date": "20240113",
+        "partner": "SkyPoints",
+        "miles_redeemed": 5000,
+        "status": "COMPLETED"
+      },
+      {
+        "txn_id": "RX10093",
+        "txn_date": "20240116",
+        "partner": "SkyPoints",
+        "miles_redeemed": 3200,
+        "status": "COMPLETED"
+      }
+    ]
+  }
+]
